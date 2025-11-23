@@ -12,6 +12,13 @@ use ValueError;
 
 class SupportStrTest extends TestCase
 {
+    /** {@inheritdoc} */
+    #[\Override]
+    protected function tearDown(): void
+    {
+        Str::createRandomStringsNormally();
+    }
+
     public function testStringCanBeLimitedByWords(): void
     {
         $this->assertSame('Taylor...', Str::words('Taylor Otwell', 1));
@@ -551,6 +558,17 @@ class SupportStrTest extends TestCase
     {
         $this->assertEquals('"value"', Str::wrap('value', '"'));
         $this->assertEquals('foo-bar-baz', Str::wrap('-bar-', 'foo', 'baz'));
+    }
+
+    public function testWrapEdgeCases()
+    {
+        $this->assertSame('[]mid[]', Str::wrap('mid', '[]'));
+        $this->assertSame('(mid', Str::wrap('mid', '(', ''));
+        $this->assertSame('<mid<', Str::wrap('mid', '<'));
+        $this->assertSame('value', Str::wrap('value', ''));
+        $this->assertSame('[][]', Str::wrap('', '[]'));
+        $this->assertSame('«値»', Str::wrap('値', '«', '»'));
+        $this->assertSame('🧪X🧪', Str::wrap('X', '🧪'));
     }
 
     public function testUnwrap()
@@ -1284,6 +1302,16 @@ class SupportStrTest extends TestCase
         $this->assertSame('Мама мыла раму', Str::ucfirst('мама мыла раму'));
     }
 
+    public function testUcwords()
+    {
+        $this->assertSame('Laravel', Str::ucwords('laravel'));
+        $this->assertSame('Laravel Framework', Str::ucwords('laravel framework'));
+        $this->assertSame('Laravel-Framework', Str::ucwords('laravel-framework', '-'));
+        $this->assertSame('Мама', Str::ucwords('мама'));
+        $this->assertSame('Мама Мыла Раму', Str::ucwords('мама мыла раму'));
+        $this->assertSame('JJ Watt', Str::ucwords('JJ watt'));
+    }
+
     public function testUcsplit()
     {
         $this->assertSame(['Laravel_p_h_p_framework'], Str::ucsplit('Laravel_p_h_p_framework'));
@@ -1858,6 +1886,21 @@ class SupportStrTest extends TestCase
         }, 'foo baz baz bar', 1);
 
         $this->assertSame('foo baZ baz bar', $result);
+    }
+
+    public function testPlural(): void
+    {
+        $this->assertSame('Laracon', Str::plural('Laracon', 1));
+        $this->assertSame('Laracon', Str::plural('Laracon', [2025]));
+
+        $this->assertSame('Laracons', Str::plural('Laracon', 3));
+        $this->assertSame('Laracons', Str::plural('Laracon', [2024, 2025]));
+
+        $this->assertSame('1 Laracon', Str::plural('Laracon', 1, prependCount: true));
+        $this->assertSame('1 Laracon', Str::plural('Laracon', [2025], prependCount: true));
+
+        $this->assertSame('1,000 Laracons', Str::plural('Laracon', 1000, prependCount: true));
+        $this->assertSame('2 Laracons', Str::plural('Laracon', [2024, 2025], prependCount: true));
     }
 
     public function testPluralPascal(): void

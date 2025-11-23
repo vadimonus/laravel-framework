@@ -7,7 +7,6 @@ use Illuminate\Cache\RedisStore;
 use Illuminate\Foundation\Testing\Concerns\InteractsWithRedis;
 use Illuminate\Redis\Connections\PhpRedisClusterConnection;
 use Illuminate\Support\Facades\Cache;
-use Illuminate\Support\Facades\Redis;
 use Illuminate\Support\Sleep;
 use Mockery as m;
 use Orchestra\Testbench\TestCase;
@@ -266,5 +265,29 @@ class RedisStoreTest extends TestCase
 
         $store->increment('foo');
         $this->assertEquals(2, $store->get('foo'));
+    }
+
+    public function testTagsCanBeFlushedWithLargeNumberOfKeys()
+    {
+        Cache::store('redis')->clear();
+
+        $tags = ['large-test-'.time()];
+
+        for ($i = 1; $i <= 5000; $i++) {
+            Cache::store('redis')->tags($tags)->put("key:{$i}", "value:{$i}", 300);
+        }
+
+        $this->assertEquals('value:1', Cache::store('redis')->tags($tags)->get('key:1'));
+        $this->assertEquals('value:2500', Cache::store('redis')->tags($tags)->get('key:2500'));
+        $this->assertEquals('value:5000', Cache::store('redis')->tags($tags)->get('key:5000'));
+
+        Cache::store('redis')->tags($tags)->flush();
+
+        $this->assertNull(Cache::store('redis')->tags($tags)->get('key:1'));
+        $this->assertNull(Cache::store('redis')->tags($tags)->get('key:2500'));
+        $this->assertNull(Cache::store('redis')->tags($tags)->get('key:5000'));
+
+        $keyCount = Cache::store('redis')->connection()->keys('*');
+        $this->assertCount(0, $keyCount);
     }
 }

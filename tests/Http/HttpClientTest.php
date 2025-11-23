@@ -15,6 +15,8 @@ use GuzzleHttp\Psr7\Utils;
 use GuzzleHttp\TransferStats;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Contracts\Support\Arrayable;
+use Illuminate\Http\Client\Batch;
+use Illuminate\Http\Client\BatchInProgressException;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Events\RequestSending;
 use Illuminate\Http\Client\Events\ResponseReceived;
@@ -30,6 +32,7 @@ use Illuminate\Http\Response as HttpResponse;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Defer\DeferredCallback;
 use Illuminate\Support\Fluent;
 use Illuminate\Support\Sleep;
 use Illuminate\Support\Str;
@@ -1298,9 +1301,10 @@ class HttpClientTest extends TestCase
                 'message' => 'The Request can not be completed',
             ],
         ];
+
         $response = new Psr7Response(403, [], json_encode($error));
 
-        throw new RequestException(new Response($response));
+        throw tap(new RequestException(new Response($response)), fn ($exception) => $exception->report());
     }
 
     public function testRequestExceptionTruncatedSummary()
@@ -1316,7 +1320,7 @@ class HttpClientTest extends TestCase
         ];
         $response = new Psr7Response(403, [], json_encode($error));
 
-        throw new RequestException(new Response($response));
+        throw tap(new RequestException(new Response($response)), fn ($exception) => $exception->report());
     }
 
     public function testRequestExceptionWithoutTruncatedSummary()
@@ -1334,7 +1338,7 @@ class HttpClientTest extends TestCase
         ];
         $response = new Psr7Response(403, [], json_encode($error));
 
-        throw new RequestException(new Response($response));
+        throw tap(new RequestException(new Response($response)), fn ($exception) => $exception->report());
     }
 
     public function testRequestExceptionWithCustomTruncatedSummary()
@@ -1352,7 +1356,7 @@ class HttpClientTest extends TestCase
         ];
         $response = new Psr7Response(403, [], json_encode($error));
 
-        throw new RequestException(new Response($response));
+        throw tap(new RequestException(new Response($response)), fn ($exception) => $exception->report());
     }
 
     public function testRequestLevelTruncationLevelOnRequestException()
@@ -1369,6 +1373,8 @@ class HttpClientTest extends TestCase
         } catch (RequestException $e) {
             $exception = $e;
         }
+
+        $exception->report();
 
         $this->assertEquals("HTTP request returned status code 403:\n[\"e (truncated...)\n", $exception->getMessage());
 
@@ -1391,6 +1397,8 @@ class HttpClientTest extends TestCase
             $exception = $e;
         }
 
+        $exception->report();
+
         $this->assertEquals("HTTP request returned status code 403:\nHTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\r\n[\"error\"]\n", $exception->getMessage());
 
         $this->assertEquals(60, RequestException::$truncateAt);
@@ -1411,6 +1419,8 @@ class HttpClientTest extends TestCase
             $exception = $e;
         }
 
+        $exception->report();
+
         $this->assertEquals("HTTP request returned status code 403:\n[\"e (truncated...)\n", $exception->getMessage());
 
         $this->assertFalse(RequestException::$truncateAt);
@@ -1425,6 +1435,8 @@ class HttpClientTest extends TestCase
 
         $exception = $this->factory->async()->throw()->truncateExceptionsAt(4)->get('http://foo.com/json')->wait();
 
+        $exception->report();
+
         $this->assertInstanceOf(RequestException::class, $exception);
         $this->assertEquals("HTTP request returned status code 403:\n[\"er (truncated...)\n", $exception->getMessage());
         $this->assertFalse(RequestException::$truncateAt);
@@ -1438,6 +1450,26 @@ class HttpClientTest extends TestCase
         $response = new Psr7Response(403);
 
         throw new RequestException(new Response($response));
+    }
+
+    public function testReportingExceptionTwiceDoesNotIncludeSummaryTwice()
+    {
+        RequestException::dontTruncate();
+
+        $error = [
+            'error' => [
+                'code' => 403,
+                'message' => 'The Request can not be completed',
+            ],
+        ];
+
+        $response = new Psr7Response(403, [], json_encode($error));
+
+        $exception = new RequestException(new Response($response));
+        $exception->report();
+        $exception->report();
+
+        $this->assertEquals(1, substr_count($exception->getMessage(), '{"error":{"code":403,"message":"The Request can not be completed"}}'));
     }
 
     public function testOnErrorDoesntCallClosureOnInformational()
@@ -1905,6 +1937,27 @@ class HttpClientTest extends TestCase
         $this->assertSame('Fake', tap($history[0]['response']->getBody())->rewind()->getContents());
 
         $this->assertSame(['hyped-for' => 'laravel-movie'], json_decode(tap($history[0]['request']->getBody())->rewind()->getContents(), true));
+    }
+
+    public function testPoolConcurrency()
+    {
+        $this->factory->fake([
+            '200.com' => $this->factory::response('', 200),
+            '400.com' => $this->factory::response('', 400),
+            '500.com' => $this->factory::response('', 500),
+        ]);
+
+        $responses = $this->factory->pool(function (Pool $pool) {
+            return [
+                $pool->get('200.com'),
+                $pool->get('400.com'),
+                $pool->get('500.com'),
+            ];
+        }, 2);
+
+        $this->assertSame(200, $responses[0]->status());
+        $this->assertSame(400, $responses[1]->status());
+        $this->assertSame(500, $responses[2]->status());
     }
 
     public function testTheRequestSendingAndResponseReceivedEventsAreFiredWhenARequestIsSent()
@@ -3464,6 +3517,21 @@ class HttpClientTest extends TestCase
         $this->assertTrue($this->factory->preventingStrayRequests());
     }
 
+    public function testAllowingStrayRequestUrls()
+    {
+        $this->assertFalse($this->factory->preventingStrayRequests());
+        $this->assertTrue($this->factory->isAllowedRequestUrl('127.0.0.1'));
+
+        $this->factory->preventStrayRequests();
+        $this->assertFalse($this->factory->isAllowedRequestUrl('127.0.0.1'));
+        $this->factory->allowStrayRequests([
+            '127.0.0.1',
+        ]);
+
+        $this->assertTrue($this->factory->preventingStrayRequests());
+        $this->assertTrue($this->factory->isAllowedRequestUrl('127.0.0.1'));
+    }
+
     public function testItCanAddAuthorizationHeaderIntoRequestUsingBeforeSendingCallback()
     {
         $this->factory->fake();
@@ -3772,6 +3840,318 @@ class HttpClientTest extends TestCase
         $factory = new Factory();
 
         $this->assertInstanceOf(PendingRequest::class, $factory->createPendingRequest());
+    }
+
+    public function testBatchNoCallbacks(): void
+    {
+        $this->factory->fake([
+            'https://200.com' => $this->factory::response('OK', 200),
+            'https://201.com' => $this->factory::response('Created', 201),
+            'https://500.com' => $this->factory::response('Error', 500),
+        ]);
+
+        $batch = $this->factory->batch(function (Batch $batch) {
+            return [
+                $batch->as('first')->get('https://200.com'),
+                $batch->as('second')->get('https://201.com'),
+                $batch->as('third')->get('https://500.com'),
+            ];
+        });
+
+        $this->assertSame(3, $batch->totalRequests);
+        $this->assertFalse($batch->finished());
+
+        $responses = $batch->send();
+
+        $this->assertSame(200, $responses['first']->status());
+        $this->assertSame(201, $responses['second']->status());
+        $this->assertSame(500, $responses['third']->status());
+
+        $this->assertSame(3, $batch->totalRequests);
+        $this->assertSame(0, $batch->pendingRequests);
+        $this->assertSame(1, $batch->failedRequests);
+        $this->assertTrue($batch->hasFailures());
+        $this->assertTrue($batch->finished());
+    }
+
+    public function testBatchDefer(): void
+    {
+        $this->factory->fake([
+            'https://200.com' => $this->factory::response('OK', 200),
+            'https://201.com' => $this->factory::response('Created', 201),
+            'https://500.com' => $this->factory::response('Error', 500),
+        ]);
+
+        $batch = $this->factory->batch(function (Batch $batch) {
+            return [
+                $batch->as('first')->get('https://200.com'),
+                $batch->as('second')->get('https://201.com'),
+                $batch->as('third')->get('https://500.com'),
+            ];
+        });
+
+        $this->assertSame(3, $batch->totalRequests);
+        $this->assertFalse($batch->finished());
+
+        $deferredCallback = $batch->defer();
+
+        $this->assertInstanceOf(DeferredCallback::class, $deferredCallback);
+        $this->assertFalse($batch->finished());
+    }
+
+    public function testCannotAddRequestsToInProgressBatch(): void
+    {
+        $this->expectException(BatchInProgressException::class);
+
+        $this->factory->fake([
+            'https://200.com' => $this->factory::response('OK', 200),
+            'https://201.com' => $this->factory::response('Created', 201),
+            'https://500.com' => $this->factory::response('Error', 500),
+        ]);
+
+        $responses = $this->factory->batch(function (Batch $batch) {
+            return [
+                $batch->as('first')->get('https://200.com'),
+                $batch->as('second')->get('https://201.com'),
+            ];
+        })->progress(function (Batch $batch, int|string $key, Response $response) use (&$progressCallbacks) {
+            $batch->as('third')->get('https://500.com');
+        })->send();
+    }
+
+    public function testBatchBeforeHook(): void
+    {
+        $this->factory->fake([
+            'https://200.com' => $this->factory::response('OK', 200),
+            'https://201.com' => $this->factory::response('Created', 201),
+        ]);
+
+        $beforeCallback = false;
+
+        $responses = $this->factory->batch(function (Batch $batch) {
+            return [
+                $batch->as('first')->get('https://200.com'),
+                $batch->as('second')->get('https://201.com'),
+            ];
+        })->before(function (Batch $batch) use (&$beforeCallback) {
+            $beforeCallback = true;
+        })->send();
+
+        $this->assertSame(200, $responses['first']->status());
+        $this->assertSame(201, $responses['second']->status());
+        $this->assertTrue($beforeCallback);
+    }
+
+    public function testBatchProgressHook(): void
+    {
+        $this->factory->fake([
+            'https://200.com' => $this->factory::response('OK', 200),
+            'https://201.com' => $this->factory::response('Created', 201),
+            'https://500.com' => $this->factory::response('Error', 500),
+        ]);
+
+        $progressCallbacks = [];
+
+        $responses = $this->factory->batch(function (Batch $batch) {
+            return [
+                $batch->as('first')->get('https://200.com'),
+                $batch->as('second')->get('https://201.com'),
+                $batch->as('third')->get('https://500.com'),
+            ];
+        })->progress(function (Batch $batch, int|string $key, Response $response) use (&$progressCallbacks) {
+            $progressCallbacks[$key] = $response;
+        })->send();
+
+        $this->assertSame(200, $responses['first']->status());
+        $this->assertSame(201, $responses['second']->status());
+        $this->assertSame(500, $responses['third']->status());
+
+        $this->assertCount(2, $progressCallbacks);
+        $this->assertArrayHasKey('first', $progressCallbacks);
+        $this->assertArrayHasKey('second', $progressCallbacks);
+        $this->assertArrayNotHasKey('third', $progressCallbacks);
+
+        $this->assertSame($responses['first'], $progressCallbacks['first']);
+        $this->assertSame($responses['second'], $progressCallbacks['second']);
+    }
+
+    public function testBatchCatchHook(): void
+    {
+        $this->factory->fake([
+            'https://200.com' => $this->factory::response('OK', 200),
+            'https://201.com' => $this->factory::response('Created', 201),
+            'https://500.com' => $this->factory::response('Error', 500),
+        ]);
+
+        $catchCallbacks = [];
+
+        $responses = $this->factory->batch(function (Batch $batch) {
+            return [
+                $batch->as('first')->get('https://200.com'),
+                $batch->as('second')->get('https://201.com'),
+                $batch->as('third')->get('https://500.com'),
+            ];
+        })->catch(function (Batch $batch, int|string $key, Response|RequestException $response) use (&$catchCallbacks) {
+            $catchCallbacks[$key] = $response;
+        })->send();
+
+        $this->assertSame(200, $responses['first']->status());
+        $this->assertSame(201, $responses['second']->status());
+        $this->assertSame(500, $responses['third']->status());
+
+        $this->assertCount(1, $catchCallbacks);
+        $this->assertArrayNotHasKey('first', $catchCallbacks);
+        $this->assertArrayNotHasKey('second', $catchCallbacks);
+        $this->assertArrayHasKey('third', $catchCallbacks);
+
+        $this->assertSame($responses['third'], $catchCallbacks['third']);
+    }
+
+    public function testBatchThenHookIsCalled(): void
+    {
+        $this->factory->fake([
+            'https://200.com' => $this->factory::response('OK', 200),
+            'https://201.com' => $this->factory::response('Created', 201),
+        ]);
+
+        $thenCallback = [];
+
+        $responses = $this->factory->batch(function (Batch $batch) {
+            return [
+                $batch->as('first')->get('https://200.com'),
+                $batch->as('second')->get('https://201.com'),
+            ];
+        })->then(function (Batch $batch, array $results) use (&$thenCallback) {
+            $thenCallback = $results;
+        })->send();
+
+        $this->assertSame(200, $responses['first']->status());
+        $this->assertSame(201, $responses['second']->status());
+
+        $this->assertCount(2, $thenCallback);
+        $this->assertArrayHasKey('first', $thenCallback);
+        $this->assertArrayHasKey('second', $thenCallback);
+
+        $this->assertSame($responses['first'], $thenCallback['first']);
+        $this->assertSame($responses['second'], $thenCallback['second']);
+    }
+
+    public function testBatchThenHookIsNotCalled(): void
+    {
+        $this->factory->fake([
+            'https://200.com' => $this->factory::response('OK', 200),
+            'https://500.com' => $this->factory::response('Error', 500),
+        ]);
+
+        $thenCallback = [];
+
+        $responses = $this->factory->batch(function (Batch $batch) {
+            return [
+                $batch->as('first')->get('https://200.com'),
+                $batch->as('second')->get('https://500.com'),
+            ];
+        })->then(function (Batch $batch, array $results) use (&$thenCallback) {
+            $thenCallback = $results;
+        })->send();
+
+        $this->assertSame(200, $responses['first']->status());
+        $this->assertSame(500, $responses['second']->status());
+
+        $this->assertCount(0, $thenCallback);
+    }
+
+    public function testBatchFinallyHookIsCalledWithoutErrors(): void
+    {
+        $this->factory->fake([
+            'https://200.com' => $this->factory::response('OK', 200),
+            'https://201.com' => $this->factory::response('Created', 201),
+        ]);
+
+        $finallyCallback = [];
+
+        $responses = $this->factory->batch(function (Batch $batch) {
+            return [
+                $batch->as('first')->get('https://200.com'),
+                $batch->as('second')->get('https://201.com'),
+            ];
+        })->finally(function (Batch $batch, array $results) use (&$finallyCallback) {
+            $finallyCallback = $results;
+        })->send();
+
+        $this->assertSame(200, $responses['first']->status());
+        $this->assertSame(201, $responses['second']->status());
+
+        $this->assertCount(2, $finallyCallback);
+        $this->assertArrayHasKey('first', $finallyCallback);
+        $this->assertArrayHasKey('second', $finallyCallback);
+
+        $this->assertSame($responses['first'], $finallyCallback['first']);
+        $this->assertSame($responses['second'], $finallyCallback['second']);
+    }
+
+    public function testBatchFinallyHookIsCalledWithErrors(): void
+    {
+        $this->factory->fake([
+            'https://200.com' => $this->factory::response('OK', 200),
+            'https://500.com' => $this->factory::response('Error', 500),
+        ]);
+
+        $finallyCallback = [];
+
+        $responses = $this->factory->batch(function (Batch $batch) {
+            return [
+                $batch->as('first')->get('https://200.com'),
+                $batch->as('second')->get('https://500.com'),
+            ];
+        })->finally(function (Batch $batch, array $results) use (&$finallyCallback) {
+            $finallyCallback = $results;
+        })->send();
+
+        $this->assertSame(200, $responses['first']->status());
+        $this->assertSame(500, $responses['second']->status());
+
+        $this->assertCount(2, $finallyCallback);
+        $this->assertArrayHasKey('first', $finallyCallback);
+        $this->assertArrayHasKey('second', $finallyCallback);
+
+        $this->assertSame($responses['first'], $finallyCallback['first']);
+        $this->assertSame($responses['second'], $finallyCallback['second']);
+    }
+
+    public function testBatchConcurrency(): void
+    {
+        $this->factory->fake([
+            'https://200.com' => $this->factory::response('OK', 200),
+            'https://201.com' => $this->factory::response('Created', 201),
+            'https://202.com' => $this->factory::response('Accepted', 202),
+            'https://203.com' => $this->factory::response('Non-Authoritative Information', 203),
+        ]);
+
+        $executionOrder = [];
+
+        $batch = $this->factory->batch(function (Batch $batch) {
+            return [
+                $batch->as('first')->get('https://200.com'),
+                $batch->as('second')->get('https://201.com'),
+                $batch->as('third')->get('https://202.com'),
+                $batch->as('fourth')->get('https://203.com'),
+            ];
+        })->progress(function (Batch $batch, int|string $key, Response $response) use (&$executionOrder) {
+            $executionOrder[] = $key;
+        })->concurrency(2);
+
+        $this->assertSame(4, $batch->totalRequests);
+
+        $responses = $batch->send();
+
+        $this->assertSame(200, $responses['first']->status());
+        $this->assertSame(201, $responses['second']->status());
+        $this->assertSame(202, $responses['third']->status());
+        $this->assertSame(203, $responses['fourth']->status());
+
+        $this->assertSame(4, $batch->totalRequests);
+        $this->assertSame(0, $batch->pendingRequests);
+        $this->assertSame(0, $batch->failedRequests);
     }
 
     public static function methodsReceivingArrayableDataProvider()
